@@ -63,8 +63,7 @@ class Quantizer:
 
         for key in total_activations.keys():
             total_activations[key] = torch.stack(total_activations[key])
-        
-        self.activation_data = list(total_activations.values())
+        self.activation_data = total_activations
         return self.activation_data
 
 
@@ -154,7 +153,7 @@ class Quantizer:
                     elif self.activation_configuration[idx] == "fp16":
                         setattr(model, name, nn.Sequential(module, Qfloat16TensorLayer()))
                     else: 
-                        scale = calibration(self.activation_data[idx], 
+                        scale = calibration(self.activation_data[str(id(module))], 
                                             precision=self.activation_configuration[idx], 
                                             granularity=self.activation_granularity, 
                                             calibration_type=self.calibration_type)

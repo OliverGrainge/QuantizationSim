@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from activation_quantization import ActivationCollector
 
-qmodel = models.resnet18().eval()
+qmodel = models.MobileNetV2().eval()
 
 print(qmodel)
 class CalibrationDataset(Dataset):
