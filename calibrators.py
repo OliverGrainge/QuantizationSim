@@ -1,6 +1,7 @@
 
 
 import torch 
+from torch.optim import Adam
 from weight_quantization import get_qrange, quantize_filter, quantize_channel, quantize_tensor
 
 
