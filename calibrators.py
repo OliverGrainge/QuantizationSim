@@ -3,6 +3,8 @@
 import torch 
 from torch.optim import Adam
 import torch.nn.functional as F
+from scipy import optimize
+import numpy as np
 from weight_quantization import get_qrange, quantize_filter, quantize_channel, quantize_tensor
 
 
@@ -16,7 +18,7 @@ def minmax_scaler(tensor: torch.tensor, precision: str = "int8", granularity="te
         min_val, max_val = tensor.min(), tensor.max()
         max_abs = max(abs(min_val), abs(max_val))
         scale = max_abs / max(qmax, -qmin)
-        return scale.clone().detach().requires_grad_(True)
+        return torch.tensor([scale])
 
     elif granularity == "channel":
         scales = []
@@ -48,151 +50,47 @@ def minmax_scaler(tensor: torch.tensor, precision: str = "int8", granularity="te
 
 ####################################### Entropy Calibrator ################################
 
-def kl_divergence(p, q):
-    # KL divergence between two distributions
-    return (p * (p / q).log()).sum()
+def kl_divergence_objective(scale, fp_tensor, granularity, precision):
+    scale = torch.tensor(scale)
+    qmin, qmax = get_qrange(precision=precision)
+
+    if granularity == "tensor" or fp_tensor.ndim <= 2:
+        q_tensor = quantize_tensor(fp_tensor, scale, qmin, qmax)
+    elif granularity == "filter":
+        q_tensor = quantize_tensor(fp_tensor, scale, qmin, qmax)
+    elif granularity == "channel":
+        q_tensor = quantize_channel(fp_tensor, scale, qmin, qmax)
+    else:
+        raise Exception("Granularity not Implemented")
+
+    hist, bins = torch.histogram(fp_tensor, bins=100)
+    qhist, bins = torch.histogram(q_tensor.float(), bins.float())
+    hist = hist.detach().float().numpy()
+    qhist = qhist.detach().float().numpy()
+    # replace zeros to avoid division by zero 
+    hist = np.where(hist == 0, np.finfo(float).eps, hist)
+    qhist = np.where(qhist == 0, np.finfo(float).eps, qhist)
+
+    kl_div = np.sum(hist * np.log(hist / qhist))
+    return kl_div
 
 
 def entropy_scaler(tensor: torch.tensor, precision: str = "int8", granularity="tensor"):
     if precision == "fp32" or precision == "fp16":
         return None
+    
+    initial_scale = minmax_scaler(tensor, precision=precision, granularity=granularity).detach().numpy()
+    bounds = [(b - 0.01, b + 0.01) for b in initial_scale]
+    result = optimize.minimize(
+        kl_divergence_objective,
+        initial_scale,
+        args=(tensor, granularity, precision),
+        method="L-BFGS-B",
+        bounds=bounds
+    ) 
+    print(initial_scale - result.x)
+    return torch.tensor(result.x)
 
-    tensor.requires_grad_(True)
-    # Calculate the histogram of the activations
-    # The number of bins could be set to the range of the precision
-    qmin, qmax = get_qrange(precision=precision)
-    num_bins = int(qmax - qmin + 1)
-
-    if granularity == "tensor" or tensor.ndim <= 2:
-        hist = torch.histc(
-            tensor, bins=num_bins, min=tensor.min().item(), max=tensor.max().item()
-        )
-        prob_dist = hist / hist.sum()
-    elif granularity == "filter":
-        hist = torch.stack(
-            [
-                torch.histc(
-                    filt, bins=num_bins, min=filt.min().item(), max=filt.max().item()
-                )
-                for filt in tensor
-            ]
-        )
-    elif granularity == "channel":
-        tensor_reshaped = (
-            tensor.permute(1, 0, 2, 3).contiguous().view(tensor.size(1), -1)
-        )
-        hist = torch.stack(
-            [
-                torch.histc(
-                    chan, bins=num_bins, min=chan.min().item(), max=chan.max().item()
-                )
-                for chan in tensor_reshaped
-            ]
-        )
-
-    # Initialize the scale with some reasonable values
-    if granularity == "tensor" or tensor.ndim <= 2:
-        max_abs = max(abs(tensor.min()), abs(tensor.max()))
-        scale = torch.tensor(max_abs / max(qmax, -qmin), requires_grad=True)
-        scale = torch.nn.Parameter(scale)
-    elif granularity == "filter":
-        max_abs = torch.amax(tensor.abs(), dim=(1, 2, 3))
-        scale = max_abs / max(qmax, -qmin)
-        scale = torch.nn.Parameter(scale)
-    elif granularity == "channel":
-        max_abs = torch.amax(tensor.abs(), dim=(0, 2, 3))
-        scale = max_abs / max(qmax, -qmin)
-        scale = torch.nn.Parameter(scale)
-
-    optimizer = Adam([scale], lr=0.01)
-
-    for _ in range(1000):  # Run for a number of iterations
-        optimizer.zero_grad()
-
-        # Compute the quantized tensor
-        if granularity == "tensor" or tensor.ndim <= 2:
-            quantized_tensor = quantize_tensor(tensor, scale, qmin, qmax)
-
-            # Compute the histogram of the quantized tensor
-            q_hist = torch.histc(
-                quantized_tensor,
-                bins=num_bins,
-                min=tensor.min().item(),
-                max=tensor.max().item(),
-            )
-            q_prob_dist = q_hist / q_hist.sum()
-
-            # Compute the KL divergence
-            loss = kl_divergence(prob_dist, q_prob_dist)
-
-            # Perform the optimization step
-            loss.backward()
-            optimizer.step()
-
-        elif granularity == "filter":
-            quantized_tensor = quantize_filter(tensor, scale, qmin, qmax)
-
-            # Compute the histogram of the quantized tensor
-            q_hist = torch.stack(
-                [
-                    torch.histc(
-                        filt, bins=num_bins, min=tensor[i].min(), max=tensor[i].max()
-                    )
-                    for i, filt in enumerate(quantized_tensor)
-                ]
-            )
-            q_prob_dist = q_hist / q_hist.sum(1, keepdims=True)
-
-            # Compute the KL divergence
-            loss = torch.stack(
-                [
-                    kl_divergence(prob_dist[i], q_prob_dist[i])
-                    for i in range(q_hist.size(0))
-                ]
-            ).mean()
-
-            # Perform the optimization step
-            loss.backward()
-            optimizer.step()
-
-        elif granularity == "channel":
-            quantized_tensor = quantize_channel(tensor, scale, qmin, qmax)
-
-            # Compute the histogram of the quantized tensor
-            reshaped_qtensor = (
-                quantized_tensor.permute(1, 0, 2, 3)
-                .contiguous()
-                .view(quantized_tensor.size(1), -1)
-            )
-            q_hist = torch.stack(
-                [
-                    torch.histc(
-                        chan,
-                        bins=num_bins,
-                        min=tensor_reshaped[i].min(),
-                        max=tensor_reshaped[i].max(),
-                    )
-                    for i, chan in enumerate(reshaped_qtensor)
-                ]
-            )
-            q_prob_dist = q_hist / q_hist.sum(1, keepdims=True)
-
-            # Compute the KL divergence
-            loss = torch.stack(
-                [
-                    kl_divergence(prob_dist[i], q_prob_dist[i])
-                    for i in range(q_hist.size(0))
-                ]
-            ).mean()
-
-            # Perform the optimization step
-            loss.backward()
-            optimizer.step()
-
-        # Ensure that scale is always positive and zero_point is within range
-        scale.data.clamp_(min=1e-8)
-    print("THEERE")
-    return scale.item()
 
 
 ####################################### Perceintile Calibrator ########################
