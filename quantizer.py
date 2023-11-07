@@ -3,55 +3,8 @@ import torch.nn as nn
 from activation_quantization import ActivationCollector, Qfloat16TensorLayer, QintTensorLayer
 from calibrators import calibration
 from weight_quantization import quantize_weights
+from tqdm import tqdm
 
-
-def quantize_layer_recursive(
-    model,
-    module,
-    module_name,
-    state_dict,
-    configuration,
-    granularity,
-    calibration_type="minmax",
-    new_state_dict=None,
-    idx=None,
-    layer_types=(nn.Conv2d, nn.BatchNorm2d, nn.Linear)
-):
-    if new_state_dict is None:
-        new_state_dict = {}
-    if idx is None:
-        idx = 0
-
-    is_leaf_module = len(list(module.children())) == 0
-    if is_leaf_module and isinstance(module, layer_types):
-        # Apply the function to the module's weights and bias if they exist
-        for name, param in module.named_parameters():
-            if name == "weight":
-                param_key = f"{module_name}.{name}" if module_name else name
-                weight = param.data.clone().detach()
-                scale = calibration(weight, precision=configuration[idx], granularity=granularity, calibration_type=calibration_type)
-                qtensor = quantize_weights(weight, scale, precision=configuration[idx], granularity=granularity)
-                new_state_dict[param_key] = qtensor
-        idx += 1
-
-    else:
-        # Call this function recursively for each submodule
-        for name, submodule in module.named_children():
-            if name:  # avoid self-recursion on the module itself
-                full_name = f"{module_name}.{name}" if module_name else name
-                model, new_state_dict, idx = quantize_layer_recursive(
-                    model,
-                    submodule,
-                    full_name,
-                    state_dict,
-                    configuration,
-                    granularity,
-                    calibration_type=calibration_type,
-                    new_state_dict=new_state_dict,
-                    layer_types=layer_types,
-                    idx=idx,
-                )
-    return model, new_state_dict, idx
 
 
 
@@ -86,6 +39,8 @@ class Quantizer:
         self.activation_layers = activation_layers
         self.weight_layers = weight_layers
 
+        # Progress bar 
+        self.pbar = tqdm(total=self.num_activations() + self.num_layers(), desc="Quantizing Model")
 
     def collect_activations(self):
         if self.calibration_loader is None:
@@ -97,15 +52,20 @@ class Quantizer:
                 collector.register_hooks(self.model)
                 self.model(batch)
                 activations.append(collector.activations)
+
+        total_activations = {}
+        for key in activations[0].keys():
+            total_activations[key] = []
+
+        for activation_dict in activations:
+            for key, value in activation_dict.items():
+                total_activations[key].append(value)
+
+        for key in total_activations.keys():
+            total_activations[key] = torch.stack(total_activations[key])
         
-        min_length = min(len(sublist) for sublist in activations)
-        # Now, stack (or concatenate) the tensors for the first and second elements across all sublists
-        stacked_activations = []
-        for i in range(min_length):
-            # Using torch.stack to create a new dimension for stacking
-            stacked = torch.stack([sublist[i] for sublist in activations])
-            stacked_activations.append(stacked)
-        self.activation_data = stacked_activations
+        self.activation_data = list(total_activations.values())
+        return self.activation_data
 
 
     def quantize_layers(self):
@@ -114,6 +74,57 @@ class Quantizer:
 
         state_dict = self.model.state_dict()
 
+
+        def quantize_layer_recursive(
+            model,
+            module,
+            module_name,
+            state_dict,
+            configuration,
+            granularity,
+            calibration_type="minmax",
+            new_state_dict=None,
+            idx=None,
+            layer_types=(nn.Conv2d, nn.BatchNorm2d, nn.Linear)
+        ):
+            if new_state_dict is None:
+                new_state_dict = {}
+            if idx is None:
+                idx = 0
+
+            is_leaf_module = len(list(module.children())) == 0
+            if is_leaf_module and isinstance(module, layer_types):
+                # Apply the function to the module's weights and bias if they exist
+                for name, param in module.named_parameters():
+                    if name == "weight":
+                        param_key = f"{module_name}.{name}" if module_name else name
+                        weight = param.data.clone().detach()
+                        scale = calibration(weight, precision=configuration[idx], granularity=granularity, calibration_type=calibration_type)
+                        qtensor = quantize_weights(weight, scale, precision=configuration[idx], granularity=granularity)
+                        new_state_dict[param_key] = qtensor
+                self.pbar.update(1)
+                idx += 1
+                
+
+            else:
+                # Call this function recursively for each submodule
+                for name, submodule in module.named_children():
+                    if name:  # avoid self-recursion on the module itself
+                        full_name = f"{module_name}.{name}" if module_name else name
+                        model, new_state_dict, idx = quantize_layer_recursive(
+                            model,
+                            submodule,
+                            full_name,
+                            state_dict,
+                            configuration,
+                            granularity,
+                            calibration_type=calibration_type,
+                            new_state_dict=new_state_dict,
+                            layer_types=layer_types,
+                            idx=idx,
+                        )
+            return model, new_state_dict, idx
+
         self.model, new_state_dict, idx = quantize_layer_recursive(
             self.model, self.model, None, state_dict,
             self.layer_configuration,
@@ -121,10 +132,10 @@ class Quantizer:
             calibration_type=self.calibration_type,
             layer_types=self.weight_layers
         )
+        self.layers_quantized = idx
         for key in state_dict.keys():
             if key not in list(new_state_dict.keys()):
                 new_state_dict[key] = state_dict[key]
-
         self.model.load_state_dict(new_state_dict)
         return self.model
 
@@ -149,15 +160,17 @@ class Quantizer:
                                             calibration_type=self.calibration_type)
                         
                         setattr(model, name, nn.Sequential(module, QintTensorLayer(scale=scale, precision=self.activation_configuration[idx])))
+                    self.pbar.update(1)
                     idx += 1
+                    
 
                 elif len(list(module.children())) > 0:  # If module has children, recursively apply the function
                     idx = replace_relu_with_sequential_identity(module, idx)
                     
-            
             return idx
 
-        replace_relu_with_sequential_identity(self.model)
+        idx = replace_relu_with_sequential_identity(self.model)
+        self.activations_quantized = idx
         return self.model
     
     def num_activations(self):
@@ -200,7 +213,8 @@ class Quantizer:
 
     def fit(self):
         self.collect_activations()
-        self.quantize_activations()
         self.model = self.quantize_layers()
+        self.quantize_activations()
+        self.pbar.close()
         return self.model
 

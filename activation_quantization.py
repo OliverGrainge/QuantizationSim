@@ -10,17 +10,26 @@ from weight_quantization import get_qrange
 class ActivationCollector:
     def __init__(self, activation_layer_types):
         self.activation_layer_types = activation_layer_types
-        self.activations = []
+        self.activations = {}
 
     def hook_fn(self, module, input, output):
-        self.activations.append(output)
+        layer_id = id(module)  # or any other unique identifier of the layer
+        self.activations[str(layer_id)] = output
 
     def register_hooks(self, model):
         hooks = []
-        for layer in model.children():
-            if isinstance(layer, self.activation_layer_types):
-                hooks.append(layer.register_forward_hook(self.hook_fn))
-            self.register_hooks(layer)  # Recursive call for nested layers
+        
+        def recursive_register_hooks(module):
+            for layer in module.children():
+                # Check if this is a leaf module (does not have children of its own)
+                if list(layer.children()):
+                    # If it's not a leaf module, we do a recursive call
+                    recursive_register_hooks(layer)
+                elif isinstance(layer, self.activation_layer_types):
+                    # Only register a hook if it's a leaf module of the correct type
+                    hooks.append(layer.register_forward_hook(self.hook_fn))
+
+        recursive_register_hooks(model)
         return hooks
 
     def __call__(self, model, input):

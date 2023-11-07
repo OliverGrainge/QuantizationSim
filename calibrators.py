@@ -88,7 +88,6 @@ def entropy_scaler(tensor: torch.tensor, precision: str = "int8", granularity="t
         method="L-BFGS-B",
         bounds=bounds
     ) 
-    print(initial_scale - result.x)
     return torch.tensor(result.x)
 
 

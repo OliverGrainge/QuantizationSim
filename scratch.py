@@ -3,11 +3,13 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 from quantizer import Quantizer
+import torch.nn.functional as F
 
-# Define a simple 3-layer CNN with input shape 3x480x640
-model = models.resnet18(pretrained=True)
-qmodel = models.resnet18(pretrained=True)
+from activation_quantization import ActivationCollector
 
+qmodel = models.resnet18().eval()
+
+print(qmodel)
 class CalibrationDataset(Dataset):
     def __init__(self, images):
         super().__init__()
@@ -19,25 +21,24 @@ class CalibrationDataset(Dataset):
     def __getitem__(self, idx):
         return self.images[idx]
 
-cal_ds = CalibrationDataset(torch.randn(20, 3, 224, 224))
-cal_dl = DataLoader(cal_ds, batch_size=10)
+cal_ds = CalibrationDataset(torch.randn(1, 3, 224, 224))
+cal_dl = DataLoader(cal_ds, batch_size=1)
 
 quantizer = Quantizer(qmodel,
     layer_precision="int8",
     activation_precision="fp16",
     activation_granularity="tensor",
-    layer_granularity="channel",
-    calibration_type="entropy", 
+    layer_granularity="tensor",
+    calibration_type="mse", 
     calibration_loader=cal_dl,
-    activation_layers = (nn.ReLU, nn.MaxPool2d, nn.Conv2d))
+    activation_layers = (nn.ReLU, nn.ReLU6, nn.BatchNorm2d))
 
 x = torch.randn(1, 3, 480, 640)
 
 qmodel = quantizer.fit()
-
-out = model(x).flatten().detach().numpy()
-out1 = qmodel(x).flatten().detach().numpy()
-
-#for i in range(len(out)):
-#    print(out[i], out1[i])
+print("Layer Quantized ", quantizer.layers_quantized)
+print("Layer Count", quantizer.num_layers())
+print("Activation Count", quantizer.num_activations())
+print("Activations Quantized", quantizer.activations_quantized)
+print("Number Activation Collected:", len(quantizer.activation_data))
 
