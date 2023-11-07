@@ -8,16 +8,17 @@ from weight_quantization import get_qrange
 ########################################## Activation Collector ################################
 
 class ActivationCollector:
-    def __init__(self):
+    def __init__(self, activation_layer_types):
+        self.activation_layer_types = activation_layer_types
         self.activations = []
 
     def hook_fn(self, module, input, output):
         self.activations.append(output)
 
-    def register_hooks(self, model, layers=(nn.ReLU, nn.ReLU6, nn.BatchNorm2d)):
+    def register_hooks(self, model):
         hooks = []
         for layer in model.children():
-            if isinstance(layer, layers):
+            if isinstance(layer, self.activation_layer_types):
                 hooks.append(layer.register_forward_hook(self.hook_fn))
             self.register_hooks(layer)  # Recursive call for nested layers
         return hooks
@@ -30,7 +31,7 @@ class ActivationCollector:
             hook.remove()
         return self.activations
     
-    
+
 ########################################## Activation Qauntization ##############################################
 
 class QintTensorLayer(nn.Module):

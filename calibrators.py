@@ -2,6 +2,7 @@
 
 import torch 
 from torch.optim import Adam
+import torch.nn.functional as F
 from weight_quantization import get_qrange, quantize_filter, quantize_channel, quantize_tensor
 
 
@@ -194,6 +195,41 @@ def entropy_scaler(tensor: torch.tensor, precision: str = "int8", granularity="t
     return scale.item()
 
 
+####################################### Perceintile Calibrator ########################
+
+def percentile_scaler(tensor: torch.tensor, precision: str="int8", granularity="tensor", percentile=99):
+    if precision == "fp32" or precision == "fp16":
+        return None
+    
+    qmin, qmax = get_qrange(precision=precision)
+    if granularity == "tensor" or tensor.ndim <= 2:
+        _, bins = torch.histogram(tensor, bins=100)
+        max_abs = max(abs(bins[100-percentile].item()),abs(bins[percentile].item()))
+        scale = max_abs / max(qmax, -qmin)
+        return scale
+    
+    elif granularity == "filter":
+        scales = []
+        for filter in tensor:
+            _, bins = torch.histogram(filter, bins=100)
+            max_abs = max(abs(bins[100-percentile].item()), abs(bins[percentile].item()))
+            scales.append(max_abs / max(qmax, -qmin))
+        return torch.tensor(scales)
+
+    elif granularity == "channel":
+        scales = []
+        reshaped_tensor = (
+            tensor.permute(1, 0, 2, 3).contiguous().view(tensor.size(1), -1)
+        )
+
+        for i in range(reshaped_tensor.size(0)):
+            channel = reshaped_tensor[i]
+            _, bins = torch.histogram(channel, bins=100)
+            max_abs = max(abs(bins[100-percentile].item()), abs(bins[percentile].item()))
+            scales.append(max_abs/max(qmax, -qmin))
+        return torch.tensor(scales)
+
+
 ####################################### MSE Calibrator ################################
 
 
@@ -208,7 +244,7 @@ def mse_scaler(tensor: torch.tensor, precision: str = "int8", granularity="tenso
     # Initialize the scale with some reasonable values
     if granularity == "tensor" or tensor.ndim <= 2:
         max_abs = max(abs(tensor.min()), abs(tensor.max()))
-        scale = torch.tensor(max_abs / max(qmax, -qmin))
+        scale = max_abs / max(qmax, -qmin)
         scale = torch.nn.Parameter(scale)
     elif granularity == "filter":
         max_abs = torch.amax(tensor.abs(), dim=(1, 2, 3))
@@ -265,6 +301,11 @@ def calibration(tensor: torch.tensor, precision: str = "int8", granularity="tens
         scale = mse_scaler(
             tensor, precision=precision, granularity=granularity
                     )
+        return scale
+    elif calibration_type == "percentile":
+        scale = percentile_scaler(
+            tensor, precision=precision, granularity=granularity, percentile=1
+        )
         return scale
     else: 
         raise Exception("Calibrator Not Implemented")

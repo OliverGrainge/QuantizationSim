@@ -4,6 +4,7 @@ from activation_quantization import ActivationCollector, Qfloat16TensorLayer, Qi
 from calibrators import calibration
 from weight_quantization import quantize_weights
 
+
 def quantize_layer_recursive(
     model,
     module,
@@ -63,7 +64,9 @@ class Quantizer:
                  layer_granularity="channel",
                  activation_granularity="tensor", 
                  calibration_type="mse", 
-                 calibration_loader=None): 
+                 calibration_loader=None, 
+                 activation_layers=(nn.ReLU, nn.ReLU6, nn.BatchNorm2d),
+                 weight_layers=(nn.Linear, nn.Conv2d, nn.BatchNorm2d)): 
         # the pytorch model to quantize
         self.model = model
         self.state_dict = model.state_dict()
@@ -79,6 +82,9 @@ class Quantizer:
         # calibration type
         self.calibration_type = calibration_type
         self.calibration_loader = calibration_loader
+        # which are the activation layers 
+        self.activation_layers = activation_layers
+        self.weight_layers = weight_layers
 
 
     def collect_activations(self):
@@ -87,9 +93,9 @@ class Quantizer:
         else: 
             activations = []
             for batch in self.calibration_loader:
-                collector = ActivationCollector()
-                collector.register_hooks(model, layers=(nn.ReLU6, nn.ReLU, nn.BatchNorm2d))
-                model(batch)
+                collector = ActivationCollector(self.activation_layers)
+                collector.register_hooks(self.model)
+                self.model(batch)
                 activations.append(collector.activations)
         
         min_length = min(len(sublist) for sublist in activations)
@@ -108,14 +114,13 @@ class Quantizer:
 
         state_dict = self.model.state_dict()
 
-        self.model, new_state_dict, _ = quantize_layer_recursive(
+        self.model, new_state_dict, idx = quantize_layer_recursive(
             self.model, self.model, None, state_dict,
             self.layer_configuration,
             self.layer_granularity,
             calibration_type=self.calibration_type,
-            layer_types=(nn.Conv2d, nn.Linear) 
+            layer_types=self.weight_layers
         )
-
         for key in state_dict.keys():
             if key not in list(new_state_dict.keys()):
                 new_state_dict[key] = state_dict[key]
@@ -130,9 +135,8 @@ class Quantizer:
         def replace_relu_with_sequential_identity(model, idx=None):
             if idx == None:
                 idx = 0
-            
             for name, module in model.named_children():
-                if isinstance(module, (nn.ReLU6, nn.ReLU, nn.BatchNorm2d)):
+                if isinstance(module, self.activation_layers):
                     # Replace the ReLU with Sequential containing ReLU and Identity
                     if self.activation_configuration[0] == "fp32":
                         setattr(model, name, nn.Sequential(module, nn.Identity()))
@@ -155,3 +159,48 @@ class Quantizer:
 
         replace_relu_with_sequential_identity(self.model)
         return self.model
+    
+    def num_activations(self):
+        if self.calibration_loader == None:
+            raise Exception("Must pass a calibration loader to quantizer")
+        for batch in self.calibration_loader:
+            collector = ActivationCollector(self.activation_layers)
+            collector.register_hooks(self.model)
+            self.model(batch)
+            return len(collector.activations)
+
+    def num_layers(self):
+
+        def count_layer(
+            model,
+            module,
+            idx=None,
+            layer_types=(nn.Conv2d, nn.BatchNorm2d, nn.Linear)
+        ):
+            if idx is None:
+                idx = 0
+
+            is_leaf_module = len(list(module.children())) == 0
+            if is_leaf_module and isinstance(module, layer_types):
+                idx += 1
+            else:
+                # Call this function recursively for each submodule
+                for name, submodule in module.named_children():
+                    if name:  # avoid self-recursion on the module itself
+                        model, idx = count_layer(
+                            model,
+                            submodule,
+                            layer_types=layer_types,
+                            idx=idx,
+                        )
+            return model, idx
+        
+        _, layer_count = count_layer(self.model, self.model, layer_types=self.weight_layers)
+        return layer_count
+
+    def fit(self):
+        self.collect_activations()
+        self.quantize_activations()
+        self.model = self.quantize_layers()
+        return self.model
+
